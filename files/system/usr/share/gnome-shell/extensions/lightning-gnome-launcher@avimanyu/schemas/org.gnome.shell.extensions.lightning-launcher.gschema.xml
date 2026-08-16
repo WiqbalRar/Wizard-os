@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+    <schema id="org.gnome.shell.extensions.lightning-launcher" 
+      path="/org/gnome/shell/extensions/lightning-launcher/" 
+      gettext-domain="lightning-gnome-launcher-extension">
+    
+    <!-- Keybinding to open launcher -->
+    <key type="as" name="shortcut-key">
+      <default>["&lt;Control&gt;p"]</default>
+      <summary>Keyboard shortcut to open launcher search</summary>
+      <description>Global keybinding to open GNOME search (recommended: ["&lt;Control&gt;p"])</description>
+    </key>
+
+  </schema>
+</schemalist>
+

@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- Lightning Bolt Icon -->
+  <defs>
+    <style>
+      .light-mode { fill: #2e3440; }
+      .dark-mode { fill: #eceff4; }
+      @media (prefers-color-scheme: dark) {
+        .light-mode { fill: #eceff4; }
+        .dark-mode { fill: #2e3440; }
+      }
+    </style>
+  </defs>
+  
+  <!-- Background circle -->
+  <circle cx="64" cy="64" r="60" class="light-mode" opacity="0.1"/>
+  
+  <!-- Lightning bolt -->
+  <g class="light-mode">
+    <!-- Main bolt shape -->
+    <polygon points="64,8 80,44 110,44 74,104 84,120 28,60 58,60 64,8" stroke-width="1"/>
+  </g>
+</svg>

@@ -1,0 +1,79 @@
+/* Lightning GNOME Launcher — stylesheet */
+
+.lightning-overlay {
+  background-color: rgba(0, 0, 0, 0.45);
+}
+
+.lightning-launcher-box {
+  padding: 14px 14px 10px 14px;
+  border-radius: 16px;
+  background-color: rgba(22, 22, 24, 0.97);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  box-shadow: 0 16px 56px 0 rgba(0, 0, 0, 0.55);
+}
+
+/* ── Search entry ── */
+.lightning-entry {
+  padding: 16px !important;
+  margin-top: 0 !important;
+  margin-bottom: 12px !important;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.10) !important;
+  background-color: rgba(255, 255, 255, 0.07);
+  color: #ffffff;
+  font-size: 1.1em;
+  caret-color: #ffffff;
+}
+
+.lightning-entry:focus {
+  border: 1px solid rgba(255, 255, 255, 0.22) !important;
+  background-color: rgba(255, 255, 255, 0.09);
+}
+
+/* ── Scroll container ── */
+.lightning-scroll {
+  /* nothing special — natural size inside the fixed box */
+}
+
+/* ── Result list ── */
+.lightning-results {
+  padding: 0 2px 4px 2px;
+  spacing: 2px;
+}
+
+/* ── Individual result row ── */
+.lightning-result-row {
+  padding: 9px 12px;
+  border-radius: 10px;
+  background-color: transparent;
+  text-align: left;
+  border: none;
+}
+
+.lightning-result-row:hover {
+  background-color: rgba(255, 255, 255, 0.08);
+}
+
+.lightning-result-row.selected {
+  background-color: rgba(90, 140, 255, 0.25);
+  border: 1px solid rgba(90, 140, 255, 0.35);
+}
+
+/* ── Icons ── */
+.lightning-result-icon {
+  margin-right: 14px;
+  min-width: 32px;
+  min-height: 32px;
+}
+
+/* ── Result text ── */
+.lightning-result-title {
+  font-size: 1.0em;
+  font-weight: bold;
+  color: #f0f0f0;
+}
+
+.lightning-result-subtitle {
+  color: rgba(255, 255, 255, 0.50);
+  font-size: 0.82em;
+}

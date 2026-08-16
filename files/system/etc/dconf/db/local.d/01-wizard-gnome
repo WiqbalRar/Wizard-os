@@ -1,0 +1,9 @@
+[org/gnome/shell]
+enabled-extensions=['app-hider@lynith.dev','blur-my-shell@aunetx','caffeine@patapon.info','clipboard-indicator@tudmotu.com','dash-to-dock@micxgx.gmail.com','fq@megh','kiwi@kemma','kiwimenu@kemma','lightning-gnome-launcher@avimanyu','monitor@astraext.github.io','rounded-windows@marcosgt.github.io','start-overlay-in-application-view@Hex_cz','tilingshell@ferrarodomenico.com','user-theme@gnome-shell-extensions.gcampax.github.com','vertical-app-grid@lublst.github.io','wack-lockscreen-clock@rinzler69-wastaken.github.com']
+
+[org/gnome/desktop/interface]
+gtk-theme='WhiteSur-Dark'
+icon-theme='Hatter'
+cursor-theme='Bibata-Modern-Ice'
+font-name='AdwaitaMono Nerd Font 11'
+monospace-font-name='AdwaitaMono Nerd Font 11'

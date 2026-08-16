@@ -1,0 +1,2126 @@
+import Clutter from 'gi://Clutter';
+import Gio from 'gi://Gio';
+import GLib from 'gi://GLib';
+import Pango from 'gi://Pango';
+import St from 'gi://St';
+import Gdm from 'gi://Gdm';
+import Gettext from 'gettext';
+import { Extension, InjectionManager } from 'resource:///org/gnome/shell/extensions/extension.js';
+
+import { UnblankManager } from './unblank.js';
+import {
+    CLOCK_ANIMATIONS,
+    DEFAULT_CLOCK_ANIMATION,
+    DEFAULT_PROMPT_ANIMATION,
+    PROMPT_ANIMATIONS,
+    applyClockAnimation,
+    applyPromptAnimation,
+    createAnimationState,
+    getAnimationSetting,
+    resetAnimationActors,
+} from './anims.js';
+
+const shellGettext = Gettext.domain('gnome-shell').gettext.bind(Gettext.domain('gnome-shell'));
+
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as SystemActions from 'resource:///org/gnome/shell/misc/systemActions.js';
+import { WackClock } from './wackClock.js';
+import { WackCupertinoRestPrompt } from './cupertinoPrompt.js';
+import { getWallpaperAlpha, getWallpaperPromptColor, clearCache, initCache } from './alphaManager.js';
+import { WackLayout } from './layoutManager.js';
+import { NotificationManager } from './notificationManager.js';
+import {
+    PROMPT_BLUR_RADIUS,
+    PROMPT_BLUR_BRIGHTNESS,
+    NOTIF_BLUR_RADIUS,
+    NOTIF_BLUR_NAME,
+    CROSSFADE_TIME,
+    DATETIME_TOP_FRACTION,
+    HINT_VERTICAL_FRACTION,
+    HINT_NOTIF_MARGIN,
+    FADE_OUT_SCALE,
+    DATE_LABEL_HEIGHT,
+    TIME_LABEL_HEIGHT_FALLBACK,
+    CUPERTINO_UNLOCK_PANEL_FADE,
+    CUPERTINO_UNLOCK_TSO_DELAY,
+    CUPERTINO_UNLOCK_FADE_DURATION,
+    CROSSFADE_SPEED_SLOW,
+    CROSSFADE_SPEED_FAST,
+    centerClockLabel,
+} from './constants.js';
+
+function _log(msg) {
+    console.debug(msg);
+    try {
+        const file = Gio.File.new_for_path('/var/tmp/wack-debug.log');
+        const stream = file.append_to(Gio.FileCreateFlags.NONE, null);
+        stream.write_all(new TextEncoder().encode(`[INFO] ${msg}\n`), null);
+        stream.close(null);
+    } catch (e) {
+        // ignore
+    }
+}
+
+function _logError(msg) {
+    console.error(msg);
+    try {
+        const file = Gio.File.new_for_path('/var/tmp/wack-debug.log');
+        const stream = file.append_to(Gio.FileCreateFlags.NONE, null);
+        stream.write_all(new TextEncoder().encode(`[ERROR] ${msg}\n`), null);
+        stream.close(null);
+    } catch (e) {
+        // ignore
+    }
+}
+
+function _setActorVisible(actor, visible, opacity) {
+    if (!actor)
+        return;
+
+    actor.visible = visible;
+    actor.opacity = opacity;
+}
+
+const PowerProfilesIface = `<node>
+<interface name="net.hadess.PowerProfiles">
+    <property name="ActiveProfile" type="s" access="readwrite"/>
+</interface>
+</node>`;
+
+
+export default class WackLockscreenClockExtension extends Extension {
+    // ── Single Source of Truth for Prompt State ───────────────────────────
+    get _promptActive() {
+        return (this._dialog?._adjustment?.value ?? 0) > 0;
+    }
+
+    enable() {
+        const PowerProfilesProxy = Gio.DBusProxy.makeProxyWrapper(PowerProfilesIface);
+        this._powerProfilesProxy = null;
+        try {
+            this._powerProfilesProxy = new PowerProfilesProxy(
+                Gio.DBus.system,
+                'net.hadess.PowerProfiles',
+                '/net/hadess/PowerProfiles',
+                (proxy, error) => {
+                    if (error) {
+                        _logError(`WACK Lockscreen: PowerProfiles proxy error: ${error.message}`);
+                        return;
+                    }
+                    this._powerProfilesProxy.connectObject('g-properties-changed', () => {
+                        this._syncCupertinoUnlockFade();
+                    }, this);
+                    this._syncCupertinoUnlockFade();
+                }
+            );
+        } catch (e) {
+            _logError(`WACK Lockscreen: Failed to initialize PowerProfiles DBus proxy: ${e.message}`);
+        }
+
+        this._isActive = true;
+        this._gdmManager = null;
+        
+        
+
+        const dialog = Main.screenShield._dialog;
+        _log(`[WACK] enable() called, dialog=${!!dialog}`);
+        if (!dialog) return;
+
+        this._origStylesheet = undefined;
+        const userThemeFile = this._getUserThemeFile();
+        if (userThemeFile) {
+            this._origStylesheet = Main.getThemeStylesheet();
+            Main.setThemeStylesheet(userThemeFile.get_path());
+            Main.loadTheme();
+        }
+
+        if (Main.panel?.statusArea?.dateMenu?.container) {
+            this._wasDateMenuVisible = Main.panel.statusArea.dateMenu.container.visible;
+            Main.panel.statusArea.dateMenu.container.hide();
+        }
+
+        this._dialog = dialog;
+        this._originalClock = dialog._clock;
+        this._injectionManager = new InjectionManager();
+        this._idleSources = new Set();
+        this._clockAnimation = DEFAULT_CLOCK_ANIMATION;
+        this._promptAnimation = DEFAULT_PROMPT_ANIMATION;
+        this._lockscreenMode = 'wack';
+        this._cupertinoAlwaysShowUser = false;
+        this._cupertinoShowNotifsOverride = false;
+        this._showingInhibitHint = false;
+        this._inhibitHintTimeoutId = null;
+        this._finishTimeoutId = null;
+        this._finishFallbackId = null;
+        this._originalWackText = null;
+        this._originalCupertinoText = null;
+        this._originalCupertinoCount = 0;
+        this._animationState = createAnimationState();
+
+        // Track state transitions to prevent redundant side-effects
+        this._wasPromptActive = false;
+
+        this._lastWellH = undefined;
+        this._lastYCenterFraction = undefined;
+        this._authPromptAllocationId = 0;
+
+        // Cancellation counter for async _updateClockAlphaAndPromptColor calls.
+        // Incremented in disable() so in-flight promises discard their results.
+        this._wallpaperUpdateSeq = 0;
+
+        initCache();
+
+        this._notifManager = new NotificationManager(this);
+        this._loadSettings();
+        this._unblankManager = new UnblankManager(this);
+        const lockDialogGroup = Main.screenShield._lockDialogGroup;
+
+        // ── Justified Duct Tape: Background Effects Override ──────────────
+        // Prevents the shell from stomping our custom blur transitions.
+        if (dialog._updateBackgroundEffects) {
+            this._origUpdateBgEffects = dialog._updateBackgroundEffects.bind(dialog);
+            dialog._updateBackgroundEffects = () => {
+                for (const widget of dialog._backgroundGroup) {
+                    const effect = widget.get_effect('blur');
+                    if (effect) effect.set({ brightness: 1.0, radius: 0 });
+                }
+            };
+            dialog._updateBackgroundEffects();
+        }
+
+        // ── Justified Duct Tape: User Switch Visibility ───────────────────
+        this._origUpdateUserSwitchVisibility = dialog._updateUserSwitchVisibility.bind(dialog);
+        dialog._updateUserSwitchVisibility = () => {
+            this._origUpdateUserSwitchVisibility();
+            if (this._lockscreenMode === 'cupertino') {
+                dialog._otherUserButton.visible = false;
+            }
+        };
+        dialog._updateUserSwitchVisibility();
+
+        // ── Justified Duct Tape: Finish Intercept for Cupertino Fade-out ──
+        this._origFinish = dialog.finish.bind(dialog);
+        dialog.finish = (onComplete) => {
+            const isCupertino = this._lockscreenMode === 'cupertino';
+            if (isCupertino && this._cupertinoUnlockFade) {
+                // Snapshot the cache reference *now*, before _tempSessionModeOverride()
+                // flips Main.sessionMode.hasWindows and emits 'updated' below. wack-shell's
+                // _syncSessionModeUI() listens for that same signal and clears
+                // global.wack_window_snapshots as soon as hasWindows goes true, which would
+                // otherwise race ahead of the fade-in code further down in this callback.
+                const capturedSnapshots = global.wack_window_snapshots
+                    ? global.wack_window_snapshots.slice()
+                    : [];
+                console.debug(`[WACK Lockscreen] finish(): captured ${capturedSnapshots.length} snapshot(s) before session-mode override`);
+
+                const panel = Main.panel;
+                if (panel) {
+                    panel.ease({ opacity: 0, duration: CUPERTINO_UNLOCK_PANEL_FADE, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
+                }
+
+                if (this._finishTimeoutId) {
+                    GLib.source_remove(this._finishTimeoutId);
+                    this._finishTimeoutId = null;
+                }
+
+                // Wait for the panel fade-out (CUPERTINO_UNLOCK_PANEL_FADE ms) to complete, then apply the
+                // session mode override so the panel gets its user-session appearance
+                // (dateMenu, theming, extensions) before it slides in.
+                this._finishTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, CUPERTINO_UNLOCK_TSO_DELAY, () => {
+                    this._finishTimeoutId = null;
+                    this._tempSessionModeOverride();
+
+                    const duration = this._cupertinoUnlockFadeDuration;
+                    const mode = Clutter.AnimationMode.EASE_OUT_QUAD;
+
+                    if (panel) {
+                        panel.remove_all_transitions();
+                        const panelHeight = panel.height || 60;
+                        panel.translation_y = -panelHeight;
+                        panel.opacity = 255;
+                        panel.ease({ translation_y: 0, duration, mode });
+                    }
+
+                    // Check if we have cached window snapshots and fade them in
+                    console.debug(`[WACK Lockscreen] fade-in callback: ${capturedSnapshots.length} snapshot(s) available to crossfade`);
+                    if (capturedSnapshots.length > 0) {
+                        this._windowFadeContainer = new Clutter.Actor({
+                            width: global.screen_width,
+                            height: global.screen_height
+                        });
+
+                        lockDialogGroup.add_child(this._windowFadeContainer);
+                        // Place directly above `dialog` (which owns the opaque wallpaper/
+                        // _backgroundGroup) so the window textures are actually visible,
+                        // instead of set_child_below_sibling(..., null) which sank this
+                        // below the wallpaper entirely. The clock/hint/panel — which fade
+                        // to opacity 0 below — stay above this container, so as they fade
+                        // out the window textures are revealed underneath.
+                        lockDialogGroup.set_child_above_sibling(this._windowFadeContainer, this._dialog);
+
+                        const STAGGER_MS = 16; // 16ms stagger between windows
+                        capturedSnapshots.forEach((snapshot, index) => {
+                            const actor = new Clutter.Actor({
+                                content: snapshot.content,
+                                x: snapshot.rect.x,
+                                y: snapshot.rect.y,
+                                width: snapshot.rect.width,
+                                height: snapshot.rect.height,
+                                opacity: 0
+                            });
+
+                            // Calculate pivot point normalized to this window actor,
+                            // anchoring the zoom to the screen's center point.
+                            const w = Math.max(1, snapshot.rect.width);
+                            const h = Math.max(1, snapshot.rect.height);
+                            const pivotX = (global.screen_width / 2 - snapshot.rect.x) / w;
+                            const pivotY = (global.screen_height / 2 - snapshot.rect.y) / h;
+                            actor.set_pivot_point(pivotX, pivotY);
+
+                            actor.scale_x = 0.92;
+                            actor.scale_y = 0.92;
+
+                            this._windowFadeContainer.add_child(actor);
+
+                            // Active window (last in the array) fades first (delay = 0)
+                            const revIndex = capturedSnapshots.length - 1 - index;
+                            const delay = revIndex * STAGGER_MS;
+
+                            actor.ease({
+                                scale_x: 1.0,
+                                scale_y: 1.0,
+                                opacity: 255,
+                                duration: duration - delay,
+                                delay,
+                                mode,
+                            });
+                        });
+                    }
+
+                    const actorsToFade = [this._clockWrapper, this._hintContainer, this._mainBox].filter(a => a != null);
+                    actorsToFade.forEach(actor => {
+                        actor.ease({ opacity: 0, duration, mode });
+                    });
+
+                    if (this._finishTimeoutId) {
+                        GLib.source_remove(this._finishTimeoutId);
+                        this._finishTimeoutId = null;
+                    }
+                    this._finishTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, duration, () => {
+                        this._finishTimeoutId = null;
+
+                        let called = false;
+                        const safeOnComplete = () => {
+                            if (called) return;
+                            called = true;
+                            if (this._finishFallbackId) {
+                                GLib.source_remove(this._finishFallbackId);
+                                this._finishFallbackId = null;
+                            }
+                            this._restoreSessionMode();
+                            if (this._windowFadeContainer) {
+                                this._windowFadeContainer.destroy();
+                                this._windowFadeContainer = null;
+                            }
+                            global.wack_window_snapshots = [];
+                            onComplete();
+                        };
+
+                        this._origFinish(safeOnComplete);
+
+                        // Fallback in case GDM's finish hangs or never calls onComplete.
+                        // Give the shell a short grace period instead of forcing completion
+                        // on the very next idle, which can race a legitimate async finish.
+                        if (this._finishFallbackId) {
+                            GLib.source_remove(this._finishFallbackId);
+                            this._finishFallbackId = null;
+                        }
+                        this._finishFallbackId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1500, () => {
+                            this._finishFallbackId = null;
+                            safeOnComplete();
+                            return GLib.SOURCE_REMOVE;
+                        });
+
+                        return GLib.SOURCE_REMOVE;
+                    });
+                    return GLib.SOURCE_REMOVE;
+                });
+            } else {
+                this._origFinish(onComplete);
+            }
+        };
+
+        // ── Justified Duct Tape: Skip Slide-up in Cupertino Mode ──────────
+        const shield = Main.screenShield;
+        this._origContinueDeactivate = shield._continueDeactivate.bind(shield);
+        shield._continueDeactivate = (animate) => {
+            const isCupertino = this._lockscreenMode === 'cupertino';
+            if (isCupertino) {
+                shield._hideLockScreen(false);
+                if (Main.sessionMode.currentMode === 'unlock-dialog') {
+                    Main.sessionMode.popMode('unlock-dialog');
+                }
+                shield.emit('wake-up-screen');
+
+                if (shield._isGreeter) {
+                    shield._activationTime = 0;
+                    shield._setActive(false);
+                    return;
+                }
+
+                if (shield._dialog && !shield._isGreeter) shield._dialog.popModal();
+
+                if (shield._grab) {
+                    Main.popModal(shield._grab);
+                    shield._grab = null;
+                }
+
+                shield._longLightbox.lightOff();
+                shield._shortLightbox.lightOff();
+                shield._lockDialogGroup.translation_y = -global.screen_height;
+                shield._completeDeactivate();
+            } else {
+                this._origContinueDeactivate(animate);
+            }
+        };
+
+        dialog._notificationsBox.connectObject(
+            'notify::height', () => {
+                this._positionHint();
+                this._notifManager.positionOverflow();
+            },
+            'notify::visible', () => {
+                this._positionHint();
+                this._notifManager.positionOverflow();
+            },
+            this
+        );
+
+        // ── Clock Setup & Constraint-based Centering ──────────────────────
+        dialog._stack.remove_child(dialog._clock);
+        dialog._clock = new WackClock();
+        lockDialogGroup.add_child(dialog._clock);
+
+        const dateLabel = dialog._clock._dateOutput;
+        const timeLabel = dialog._clock._time;
+        dialog._clock.remove_child(dateLabel);
+        dialog._clock.remove_child(timeLabel);
+
+        this._clockWrapper = new Clutter.Actor();
+        this._clockWrapper.set_pivot_point(0.5, 0.5);
+        this._clockWrapper.add_child(dateLabel);
+        this._clockWrapper.add_child(timeLabel);
+        lockDialogGroup.add_child(this._clockWrapper);
+
+        this._dateLabel = dateLabel;
+        this._timeLabel = timeLabel;
+
+        timeLabel.connectObject('notify::text', () => this._positionClock(), this);
+        // Setup clock centering constraints
+        centerClockLabel(timeLabel, this._clockWrapper);
+        centerClockLabel(dateLabel, this._clockWrapper);
+
+        this._positionClock();
+
+        this._bgSettings = new Gio.Settings({ schema_id: 'org.gnome.desktop.background' });
+        this._interfaceSettings = new Gio.Settings({ schema_id: 'org.gnome.desktop.interface' });
+
+        const syncAlpha = () => this._updateClockAlpha();
+        this._bgSettings.connectObject(
+            'changed::picture-uri', syncAlpha,
+            'changed::picture-uri-dark', syncAlpha,
+            'changed::picture-options', syncAlpha,
+            this
+        );
+        this._interfaceSettings.connectObject(
+            'changed::color-scheme', syncAlpha,
+            this
+        );
+
+        this._updateClockAlpha();
+
+        // ── Hint Container Setup ──────────────────────────────────────────
+        this._hintContainer = new Clutter.Actor();
+        lockDialogGroup.add_child(this._hintContainer);
+
+        const hint = dialog._clock._hint;
+        this._hintContainer.add_child(hint);
+        this._hint = hint;
+        this._hintText = hint.text;
+
+        hint.connectObject(
+            'notify::text', () => {
+                if (!this._overflowActive && !this._showingInhibitHint) {
+                    this._hintText = hint.text;
+                }
+            },
+            'notify::opacity', () => {
+                const hasNotifs = this._notifManager.hasVisibleNotifs();
+                const suppressHint = this._promptActive || (this._lockscreenMode === 'cupertino' && !hasNotifs && !this._overflowActive);
+                if (suppressHint && hint.opacity > 0) {
+                    hint.remove_all_transitions();
+                    hint.set_opacity(0);
+                }
+            },
+            this
+        );
+        this._positionHint();
+
+        this._overflowLabel = new St.Label({
+            style_class: 'unlock-dialog-clock-hint',
+            x_align: Clutter.ActorAlign.CENTER,
+            opacity: 255,
+            visible: false,
+        });
+        this._overflowActive = false;
+        this._hintContainer.add_child(this._overflowLabel);
+
+        this._notifManager.setupNotifBlur(dialog._notificationsBox);
+        this._promptActor = dialog._promptBox ?? dialog._stack;
+        this._promptActor?.set_pivot_point(0.5, 0.5);
+
+        // ── Input Handling ────────────────────────────────────────────────
+        dialog.connectObject('key-press-event', (actor, event) => {
+            const keysym = event.get_key_symbol();
+
+            if (keysym === Clutter.KEY_Escape && !this._promptActive) {
+                if (this._escToSleep) {
+                    if (this._lockscreenMode === 'cupertino' && this._cupertinoAlwaysShowUser) {
+                        if (this._cupertinoShowNotifsOverride) {
+                            this._cupertinoShowNotifsOverride = false;
+                            this._updateCupertinoRestState(true);
+                            return Clutter.EVENT_STOP;
+                        }
+                    }
+                    if (Main.screenShield._loginManager) {
+                        if (this._isSleepInhibited()) {
+                            this._showInhibitHint(this.gettext('Sleep prevented by an active process'));
+                        } else {
+                            if (typeof Main.screenShield._loginManager.suspend === 'function') {
+                                Main.screenShield._loginManager.suspend();
+                            } else {
+                                try {
+                                    SystemActions.getDefault().activateSuspend();
+                                } catch (e) {
+                                    const session = SystemActions.getDefault()._session;
+                                    if (session && typeof session.SuspendAsync === 'function')
+                                        session.SuspendAsync().catch(err => console.error(err));
+                                }
+                            }
+                        }
+                        return Clutter.EVENT_STOP;
+                    }
+                }
+            }
+
+            if (this._lockscreenMode === 'cupertino' && this._cupertinoAlwaysShowUser && !this._promptActive) {
+                const state = event.get_state();
+                const shiftPressed = (state & Clutter.ModifierType.SHIFT_MASK) !== 0;
+
+                if (shiftPressed && (keysym === Clutter.KEY_N || keysym === Clutter.KEY_n)) {
+                    if (this._notifManager.getNativeNotifCount() > 0 || this._cupertinoShowNotifsOverride) {
+                        this._cupertinoHintIsToggle = false;
+                        this._cupertinoShowNotifsOverride = !this._cupertinoShowNotifsOverride;
+                        this._updateCupertinoRestState(true);
+                    }
+                    return Clutter.EVENT_STOP;
+                }
+            }
+            return Clutter.EVENT_PROPAGATE;
+        }, this);
+
+        this._applyPromptModeLayout();
+
+        Main.layoutManager.connectObject('monitors-changed', () => {
+            this._positionClock();
+            this._positionHint();
+            this._notifManager.positionOverflow();
+            this._applyPromptModeLayout();
+            this._syncLockscreenMessageLayout();
+        }, this);
+
+        // ── Core Transition Logic Intercept ───────────────────────────────
+        this._origSetTransitionProgress = dialog._setTransitionProgress.bind(dialog);
+        dialog._setTransitionProgress = (progress) => {
+            this._origSetTransitionProgress(progress);
+
+            // Unified state derivation: no more redundant assignments
+            const isNowActive = this._promptActive;
+
+            if (isNowActive && !this._wasPromptActive) {
+                this._onPromptShow();
+                const origEase = dialog._adjustment.ease;
+                dialog._adjustment.ease = () => { };
+                try { dialog._showPrompt(); }
+                finally { dialog._adjustment.ease = origEase; }
+            } else if (!isNowActive && this._wasPromptActive) {
+                this._onPromptHide();
+                const origEase = dialog._adjustment.ease;
+                dialog._adjustment.ease = () => { };
+                try { dialog._showClock(); }
+                finally { dialog._adjustment.ease = origEase; }
+            }
+            this._wasPromptActive = isNowActive;
+
+            const scaleFactor = St.ThemeContext.get_for_stage(global.stage).scale_factor;
+            const isCupertino = this._lockscreenMode === 'cupertino';
+            const globalBlur = isCupertino ? 0 : PROMPT_BLUR_RADIUS * scaleFactor * progress;
+            const globalBrightness = isCupertino ? 1.0 : 1.0 - (1.0 - PROMPT_BLUR_BRIGHTNESS) * progress;
+
+            for (const widget of dialog._backgroundGroup) {
+                const effect = widget.get_effect('blur');
+                if (effect) effect.set({ radius: globalBlur, brightness: globalBrightness });
+            }
+
+            const hasNotifs = this._notifManager.hasVisibleNotifs();
+            const cardBlur = hasNotifs ? NOTIF_BLUR_RADIUS * (1 - progress) : 0;
+
+            if (this._notifManager._notifBox && this._notifManager._notifBox._notificationBox) {
+                for (let child = this._notifManager._notifBox._notificationBox.get_first_child(); child !== null; child = child.get_next_sibling()) {
+                    let effect = child.get_effect(NOTIF_BLUR_NAME);
+                    if (effect) {
+                        effect.set({ radius: cardBlur });
+                        effect.set_enabled(cardBlur > 0.5);
+                    }
+                }
+                for (const msg of this._notifManager._notifBox._players.values()) {
+                    let effect = msg.get_effect(NOTIF_BLUR_NAME);
+                    if (effect) {
+                        effect.set({ radius: cardBlur });
+                        effect.set_enabled(cardBlur > 0.5);
+                    }
+                }
+            }
+
+            const notifOpacity = hasNotifs ? Math.round(255 * (1 - progress)) : 0;
+
+            if (this._hintContainer) {
+                this._hintContainer.opacity = isCupertino ? notifOpacity : (progress > 0 ? 0 : 255);
+            }
+
+            if (isCupertino) {
+                const authPrompt = this._dialog?._authPrompt ?? this._dialog?._promptBox?._authPrompt;
+                const mainBox = authPrompt?._mainBox;
+
+                if (this._cupertinoRestPromptContainer) {
+                    if (hasNotifs && progress === 0) {
+                        this._cupertinoRestPromptContainer.opacity = 0;
+                        this._cupertinoRestPromptContainer.visible = false;
+                    } else {
+                        const targetOpacity = hasNotifs ? Math.round(255 * progress) : 255;
+                        this._cupertinoRestPromptContainer.opacity = targetOpacity;
+                        this._cupertinoRestPromptContainer.visible = targetOpacity > 0;
+                        const subOpacity = Math.round(255 * (1 - progress));
+                        if (this._cupertinoRestPrompt?._hintBoxWrapper) {
+                            this._cupertinoRestPrompt._hintBoxWrapper.opacity = subOpacity;
+                        }
+                        const nameLabel = this._cupertinoRestPrompt?._userWell?.get_child()?._label;
+                        if (nameLabel) nameLabel.opacity = subOpacity;
+                    }
+                }
+
+                if (this._cupertinoRestPrompt?._avatarButton) {
+                    const shouldBeClickable = progress > 0;
+                    if (shouldBeClickable) {
+                        this._cupertinoRestPrompt._avatarButton.add_style_class_name('wack-avatar-clickable');
+                    } else {
+                        this._cupertinoRestPrompt._avatarButton.remove_style_class_name('wack-avatar-clickable');
+                    }
+                    this._cupertinoRestPrompt._avatarButton.reactive = shouldBeClickable;
+                    if (!shouldBeClickable) this._cupertinoRestPrompt._avatarButton.hover = false;
+                }
+
+                if (this._promptActor) {
+                    this._promptActor.set({ opacity: Math.round(255 * progress), scale_x: 1, scale_y: 1, translation_y: 0 });
+                    this._promptActor.visible = progress > 0;
+                }
+
+                if (mainBox) mainBox.opacity = Math.round(255 * progress);
+
+                const messageActor = this._getLockscreenMessageActor();
+                if (messageActor && this._lockscreenMessageLabel) {
+                    if (hasNotifs && progress === 0) {
+                        _setActorVisible(messageActor, false, 0);
+                    } else {
+                        const targetOpacity = hasNotifs ? Math.round(255 * progress) : 255;
+                        _setActorVisible(messageActor,
+                            targetOpacity > 0 && this._lockscreenMessageLabel.text !== '',
+                            targetOpacity);
+                    }
+                }
+
+                if (this._notifManager._notifBox) {
+                    this._notifManager._notifBox.opacity = notifOpacity;
+                    this._notifManager._notifBox.visible = notifOpacity > 0;
+                }
+
+                if (progress === 0) {
+                    this._notifManager.enforceCardLimit(this._notifManager._notifBox);
+                    this._updateCupertinoRestState();
+                }
+            } else {
+                applyClockAnimation(this._clockAnimation, this._clockWrapper, dialog._clock, progress, this._getClockAnimationParams(), this._animationState);
+                applyPromptAnimation(this._promptAnimation, this._promptActor, progress);
+
+                if (this._notifManager._notifBox) this._notifManager._notifBox.opacity = 255;
+                if (progress === 0) this._notifManager.enforceCardLimit(this._notifManager._notifBox);
+            }
+        };
+
+        const mainBox = dialog.get_child_at_index(dialog.get_n_children() - 1);
+        if (mainBox) {
+            this._origLayout = mainBox.layout_manager;
+
+            this._lockscreenMessageLabel = new St.Label({
+                style_class: 'wack-cupertino-lockscreen-message',
+                x_align: Clutter.ActorAlign.CENTER,
+                y_align: Clutter.ActorAlign.CENTER,
+            });
+            this._lockscreenMessageLabel.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
+            this._lockscreenMessageLabel.clutter_text.line_wrap = true;
+            this._lockscreenMessageLabel.clutter_text.line_alignment = Pango.Alignment.CENTER;
+            this._lockscreenMessageLabel.x_expand = true;
+            this._lockscreenMessageContent = new St.BoxLayout({
+                vertical: true,
+                x_align: Clutter.ActorAlign.CENTER,
+                y_align: Clutter.ActorAlign.START,
+                x_expand: true,
+            });
+            this._lockscreenMessageContent.add_child(this._lockscreenMessageLabel);
+
+            this._lockscreenMessageScrollView = new St.ScrollView({
+                style_class: 'wack-cupertino-lockscreen-message-scroll',
+                x_align: Clutter.ActorAlign.CENTER,
+                y_align: Clutter.ActorAlign.CENTER,
+                overlay_scrollbars: true,
+                enable_mouse_scrolling: true,
+                hscrollbar_policy: St.PolicyType.NEVER,
+                vscrollbar_policy: St.PolicyType.NEVER,
+                visible: false,
+            });
+            this._lockscreenMessageScrollView.set_child(this._lockscreenMessageContent);
+
+            const messageScrollbar = this._lockscreenMessageScrollView.get_vscroll_bar?.();
+            if (messageScrollbar) {
+                messageScrollbar.opacity = 0;
+                messageScrollbar.visible = false;
+                messageScrollbar.reactive = false;
+            }
+
+            this._lockscreenMessageScrollView.vadjustment?.connectObject('notify::value', () => {
+                this._syncLockscreenMessageFade();
+            }, this);
+
+            mainBox.add_child(this._lockscreenMessageScrollView);
+
+            mainBox.layout_manager = new WackLayout(this, dialog._stack, dialog._notificationsBox, dialog._otherUserButton, this._lockscreenMessageScrollView);
+            mainBox.queue_relayout();
+            this._mainBox = mainBox;
+            this._updateLockscreenMessage();
+        }
+    }
+
+    _updateClockAlpha() {
+        this._updateClockAlphaAndPromptColor();
+    }
+
+    async _updateClockAlphaAndPromptColor() {
+        const dialog = this._dialog;
+        const seq = ++this._wallpaperUpdateSeq;
+
+        if (!this._bgSettings)
+            this._bgSettings = new Gio.Settings({ schema_id: 'org.gnome.desktop.background' });
+        if (!this._interfaceSettings)
+            this._interfaceSettings = new Gio.Settings({ schema_id: 'org.gnome.desktop.interface' });
+
+        const colorScheme = this._interfaceSettings.get_enum('color-scheme');
+        const style = this._bgSettings.get_enum('picture-options');
+        const uri = this._bgSettings.get_string(
+            colorScheme === 1 ? 'picture-uri-dark' : 'picture-uri'
+        );
+        const isColor = (style === 0);
+        const primaryColor = this._bgSettings.get_string('primary-color');
+        const secondaryColor = this._bgSettings.get_string('secondary-color');
+        const shadingType = this._bgSettings.get_enum('color-shading-type');
+
+        const promptVibrancy = this._settings?.get_boolean('prompt-vibrancy') ?? true;
+
+        let wellH = 0;
+        if (this._cupertinoRestPrompt?._userWell) {
+            const [, , , hSize] = this._cupertinoRestPrompt._userWell.get_preferred_size();
+            wellH = hSize > 0 ? hSize : 0;
+        }
+
+        let yCenterFraction = null;
+        const authPrompt = this._dialog?._authPrompt ?? this._dialog?._promptBox?._authPrompt;
+        const entry = this._findPromptEntry(authPrompt);
+        if (entry) {
+            const pos = entry.get_transformed_position();
+            const yTrans = pos[1];
+            const hTrans = entry.get_height() || 0;
+            const monitor = Main.layoutManager?.primaryMonitor;
+            const monitorY = monitor ? monitor.y : 0;
+            const monitorHeight = monitor ? monitor.height : 1080;
+            if (yTrans > 0 && monitorHeight > 0) {
+                yCenterFraction = (yTrans + hTrans / 2 - monitorY) / monitorHeight;
+            }
+        }
+
+        const wallpaperParams = {
+            uri,
+            isColor,
+            primaryColor,
+            secondaryColor,
+            shadingType,
+            wellH,
+            yCenterFraction,
+        };
+        const textLuminance = dialog?._clock?.getTextLuminance?.() ?? 1.0;
+
+        // Fetch alpha and prompt color in parallel — one round trip through the cache.
+        const [alpha, promptColor] = await Promise.all([
+            getWallpaperAlpha({ ...wallpaperParams, textLuminance }),
+            promptVibrancy
+                ? getWallpaperPromptColor(wallpaperParams)
+                : Promise.resolve(null),
+        ]);
+
+        // Bail out if disable() was called while we were awaiting.
+        if (seq !== this._wallpaperUpdateSeq)
+            return;
+
+        _log(`[WACK/Extension] _updateClockAlphaAndPromptColor - uri: ${uri}, promptColor: ${JSON.stringify(promptColor)}, alpha: ${alpha}, yCenterFraction: ${yCenterFraction}`);
+
+        // Apply clock alpha to the live dialog clock widget.
+        if (dialog?._clock && typeof dialog._clock.setWallpaperAlpha === 'function')
+            dialog._clock.setWallpaperAlpha(alpha);
+
+        // Commit both values atomically to the cross-session metadata file.
+        if (this._crossSessionManager)
+            this._crossSessionManager.setClockAlphaAndPromptColor(alpha, promptColor);
+
+        // Apply live prompt entry tinting in the user session (Cupertino mode only).
+        // Note: the class is added to _promptActor, not to dialog._authPrompt.
+        const isCupertinoPromptActive = this._promptActor?.has_style_class_name('wack-cupertino-prompt');
+        if (isCupertinoPromptActive) {
+            const authPrompt = this._dialog?._authPrompt ?? this._dialog?._promptBox?._authPrompt;
+            if (promptVibrancy && promptColor)
+                this._applyPromptEntryBackground(this._findPromptEntry(authPrompt), promptColor);
+            else
+                this._clearCupertinoPromptBackground();
+        } else if (!promptVibrancy) {
+            this._clearCupertinoPromptBackground();
+        }
+    }
+
+
+
+    _findPromptEntry(actor) {
+        if (!actor)
+            return null;
+
+        if (typeof actor.has_style_class_name === 'function' &&
+            actor.has_style_class_name('login-dialog-prompt-entry')) {
+            return actor;
+        }
+
+        if (typeof actor.get_children !== 'function')
+            return null;
+
+        for (const child of actor.get_children()) {
+            const match = this._findPromptEntry(child);
+            if (match)
+                return match;
+        }
+
+        return null;
+    }
+
+    _startCursorBlink() {
+        this._stopCursorBlink();
+
+        const dialog = this._dialog;
+        if (!dialog) return;
+
+        const authPrompt = dialog._authPrompt ?? dialog._promptBox?._authPrompt;
+        const entry = this._findPromptEntry(authPrompt);
+        if (entry && entry.clutter_text) {
+            entry.clutter_text.cursor_blink = (this._cursorBlink !== false);
+            entry.clutter_text.cursor_visible = true;
+        }
+
+        if (this._cursorBlink === false)
+            return;
+
+        let visible = true;
+        this._cursorBlinkTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 500, () => {
+            const currentDialog = this._dialog;
+            if (!currentDialog || !this._promptActive) {
+                this._cursorBlinkTimeoutId = null;
+                return GLib.SOURCE_REMOVE;
+            }
+
+            const currentAuthPrompt = currentDialog._authPrompt ?? currentDialog._promptBox?._authPrompt;
+            if (!currentAuthPrompt) {
+                return GLib.SOURCE_CONTINUE;
+            }
+
+            const currentEntry = this._findPromptEntry(currentAuthPrompt);
+            if (!currentEntry || !currentEntry.clutter_text) {
+                return GLib.SOURCE_CONTINUE;
+            }
+
+            if (!currentEntry.clutter_text.has_key_focus()) {
+                currentEntry.clutter_text.cursor_visible = false;
+                return GLib.SOURCE_CONTINUE;
+            }
+
+            visible = !visible;
+            currentEntry.clutter_text.cursor_visible = visible;
+            return GLib.SOURCE_CONTINUE;
+        });
+    }
+
+    _stopCursorBlink() {
+        if (this._cursorBlinkTimeoutId) {
+            GLib.source_remove(this._cursorBlinkTimeoutId);
+            this._cursorBlinkTimeoutId = null;
+        }
+    }
+
+    _applyPromptEntryBackground(entry, color) {
+        if (!entry || !color)
+            return;
+
+        if (entry._wackOriginalStyle === undefined)
+            entry._wackOriginalStyle = entry.get_style() ?? '';
+
+        let shadowStyle = '';
+        if (color.shadowAlpha !== undefined) {
+            shadowStyle = ` box-shadow: 0 2px 24px 16px rgba(0, 0, 0, ${color.shadowAlpha.toFixed(3)}) !important;`;
+        }
+
+        entry.set_style(`${entry._wackOriginalStyle} background-color: rgb(${color.r}, ${color.g}, ${color.b}) !important;${shadowStyle}`);
+    }
+
+    _clearCupertinoPromptBackground() {
+        const authPrompt = this._dialog?._authPrompt ?? this._dialog?._promptBox?._authPrompt;
+        const entry = this._findPromptEntry(authPrompt);
+        if (!entry)
+            return;
+
+        if (entry._wackOriginalStyle !== undefined) {
+            entry.set_style(entry._wackOriginalStyle);
+            delete entry._wackOriginalStyle;
+        } else {
+            entry.set_style(null);
+        }
+    }
+
+    _onAuthPromptAllocation() {
+        _log(`[WACK/Extension] _onAuthPromptAllocation() called. promptActive=${this._promptActive}`);
+        if (!this._promptActor || !this._promptActor.has_style_class_name('wack-cupertino-prompt'))
+            return;
+
+        let wellH = 0;
+        if (this._cupertinoRestPrompt?._userWell) {
+            const [, , , hSize] = this._cupertinoRestPrompt._userWell.get_preferred_size();
+            wellH = hSize > 0 ? hSize : 0;
+        }
+
+        let yCenterFraction = null;
+        const authPrompt = this._dialog?._authPrompt ?? this._dialog?._promptBox?._authPrompt;
+        const entry = this._findPromptEntry(authPrompt);
+        _log(`[WACK/Extension] _onAuthPromptAllocation() - authPrompt found=${!!authPrompt}, entry found=${!!entry}`);
+        if (entry) {
+            const pos = entry.get_transformed_position();
+            const yTrans = pos[1];
+            const hTrans = entry.get_height() || 0;
+            const monitor = Main.layoutManager?.primaryMonitor;
+            const monitorY = monitor ? monitor.y : 0;
+            const monitorHeight = monitor ? monitor.height : 1080;
+            _log(`[WACK/Extension] _onAuthPromptAllocation() - yTrans=${yTrans}, hTrans=${hTrans}, monitorY=${monitorY}, monitorHeight=${monitorHeight}`);
+            if (yTrans > 0 && monitorHeight > 0) {
+                yCenterFraction = (yTrans + hTrans / 2 - monitorY) / monitorHeight;
+            }
+        }
+        _log(`[WACK/Extension] _onAuthPromptAllocation() - wellH=${wellH}, yCenterFraction=${yCenterFraction}, lastWellH=${this._lastWellH}, lastYCenterFraction=${this._lastYCenterFraction}`);
+
+        const wellChanged = wellH !== this._lastWellH;
+        const yCenterChanged = yCenterFraction !== null &&
+            (this._lastYCenterFraction === undefined || Math.abs(yCenterFraction - this._lastYCenterFraction) > 0.001);
+
+        if (wellChanged || yCenterChanged) {
+            if (wellChanged) this._lastWellH = wellH;
+            if (yCenterChanged) this._lastYCenterFraction = yCenterFraction;
+            this._updateClockAlphaAndPromptColor().catch(e => {
+                _logError('[WACK/Extension] Failed to update prompt background in allocation: ' + e);
+            });
+        }
+    }
+
+
+
+
+    
+
+    _syncCupertinoUnlockFade() {
+        if (!this._settings)
+            return;
+
+        const wackShell = Main.extensionManager.lookup('wack-shell@rinzler69-wastaken.github.com');
+        const wackShellEnabled = wackShell && wackShell.state === 1;
+        const isPowerSaver = this._powerProfilesProxy?.ActiveProfile === 'power-saver';
+        this._cupertinoUnlockFade = this._settings.get_string('lockscreen-mode') === 'cupertino' &&
+            wackShellEnabled &&
+            this._settings.get_boolean('cupertino-unlock-fade') &&
+            !isPowerSaver;
+    }
+
+    _loadSettings() {
+        this._notifShowInLockScreen = true;
+        this._notifSettings = new Gio.Settings({ schema_id: 'org.gnome.desktop.notifications' });
+        this._notifShowInLockScreen = this._notifSettings.get_boolean('show-in-lock-screen');
+        this._notifSettings.connectObject('changed::show-in-lock-screen', () => {
+            this._notifShowInLockScreen = this._notifSettings.get_boolean('show-in-lock-screen');
+        }, this);
+
+        this._settings = this.getSettings();
+
+        const syncClockAnimation = () => {
+            this._clockAnimation = getAnimationSetting(this._settings, 'clock-animation', DEFAULT_CLOCK_ANIMATION, CLOCK_ANIMATIONS);
+        };
+        const syncPromptAnimation = () => {
+            this._promptAnimation = getAnimationSetting(this._settings, 'prompt-animation', DEFAULT_PROMPT_ANIMATION, PROMPT_ANIMATIONS);
+        };
+        const syncLockscreenMode = () => {
+            this._lockscreenMode = this._settings.get_string('lockscreen-mode') ?? 'wack';
+            this._applyPromptModeLayout?.();
+            this._dialog?._updateUserSwitchVisibility?.();
+            this._cupertinoShowNotifsOverride = false;
+
+            const progress = this._dialog?._adjustment?.value ?? 0;
+            const isCupertino = this._lockscreenMode === 'cupertino';
+            const scaleFactor = St.ThemeContext.get_for_stage(global.stage).scale_factor;
+            const targetRadius = isCupertino ? 0 : PROMPT_BLUR_RADIUS * scaleFactor * progress;
+            const targetBrightness = isCupertino ? 1.0 : 1.0 - (1.0 - PROMPT_BLUR_BRIGHTNESS) * progress;
+
+            for (const widget of this._dialog?._backgroundGroup ?? []) {
+                const effect = widget.get_effect('blur');
+                if (effect) effect.set({ radius: targetRadius, brightness: targetBrightness });
+            }
+
+            if (this._notifManager._notifBox) {
+                this._notifManager._notifBox.opacity = isCupertino ? Math.round(255 * (1 - progress)) : 255;
+            }
+            if (this._hintContainer) {
+                this._hintContainer.opacity = isCupertino ? Math.round(255 * (1 - progress)) : (progress > 0 ? 0 : 255);
+            }
+        };
+
+        syncClockAnimation();
+        syncPromptAnimation();
+        syncLockscreenMode();
+
+        const syncCupertinoAlwaysShowUser = () => {
+            this._cupertinoAlwaysShowUser = this._settings.get_boolean('cupertino-always-show-user');
+            this._cupertinoShowNotifsOverride = false;
+            this._updateCupertinoRestState?.(true);
+        };
+        syncCupertinoAlwaysShowUser();
+
+        const syncEscToSleep = () => {
+            this._escToSleep = this._settings.get_boolean('esc-to-sleep');
+        };
+        syncEscToSleep();
+
+        const syncCupertinoUnlockFade = () => {
+            this._syncCupertinoUnlockFade();
+        };
+        syncCupertinoUnlockFade();
+
+        const syncCrossfadeSpeed = () => {
+            const speed = this._settings.get_string('cupertino-crossfade-speed') || 'slow';
+            if (speed === 'slow')
+                this._cupertinoUnlockFadeDuration = CROSSFADE_SPEED_SLOW;
+            else if (speed === 'fast')
+                this._cupertinoUnlockFadeDuration = CROSSFADE_SPEED_FAST;
+            else
+                this._cupertinoUnlockFadeDuration = CUPERTINO_UNLOCK_FADE_DURATION;
+        };
+        syncCrossfadeSpeed();
+
+        const syncPromptVibrancy = () => {
+            this._updateClockAlphaAndPromptColor();
+        };
+        syncPromptVibrancy();
+
+        const syncCursorBlink = () => {
+            this._cursorBlink = this._settings.get_boolean('cursor-blink') ?? true;
+            if (this._promptActive) {
+                this._startCursorBlink();
+            } else {
+                this._stopCursorBlink();
+            }
+        };
+        syncCursorBlink();
+
+        this._wackShellStateChangedId = Main.extensionManager.connect('extension-state-changed', (_obj, ext) => {
+            if (ext.uuid === 'wack-shell@rinzler69-wastaken.github.com') {
+                syncCupertinoUnlockFade();
+            }
+        });
+
+        this._settings.connectObject(
+            'changed::clock-animation', syncClockAnimation,
+            'changed::prompt-animation', syncPromptAnimation,
+            'changed::lockscreen-mode', syncLockscreenMode,
+            'changed::cupertino-always-show-user', syncCupertinoAlwaysShowUser,
+            'changed::esc-to-sleep', syncEscToSleep,
+            'changed::cupertino-unlock-fade', syncCupertinoUnlockFade,
+            'changed::cupertino-crossfade-speed', syncCrossfadeSpeed,
+            'changed::prompt-vibrancy', syncPromptVibrancy,
+            'changed::cursor-blink', syncCursorBlink,
+            'changed::cupertino-lockscreen-message-enable', () => this._updateLockscreenMessage(),
+            'changed::cupertino-lockscreen-message-text', () => this._updateLockscreenMessage(),
+            this
+        );
+    }
+
+    _getClockAnimationParams() {
+        const monitor = Main.layoutManager.primaryMonitor;
+        const monitorY = monitor ? monitor.y : 0;
+        const clockY = this._clockWrapper?.y ?? 0;
+        const [, natHeight] = this._clockWrapper?.get_preferred_height(-1) ?? [0, 0];
+        const [, dateHeight] = this._dateLabel?.get_preferred_height(-1) ?? [0, DATE_LABEL_HEIGHT];
+        const [, timeHeight] = this._timeLabel?.get_preferred_height(-1) ?? [0, TIME_LABEL_HEIGHT_FALLBACK];
+        const clockHeight = Math.max(natHeight, dateHeight + timeHeight, DATE_LABEL_HEIGHT + timeHeight);
+
+        return {
+            fadeOutScale: FADE_OUT_SCALE,
+            slideUpDistance: Math.ceil(Math.max(128, clockY - monitorY + clockHeight + 48)),
+        };
+    }
+
+    _idleAdd(priority, callback) {
+        let id = GLib.idle_add(priority, () => {
+            let result;
+            try {
+                result = callback();
+            } catch (e) {
+                this._idleSources.delete(id);
+                throw e;
+            }
+            if (result !== GLib.SOURCE_CONTINUE) this._idleSources.delete(id);
+            return result;
+        });
+        this._idleSources.add(id);
+        return id;
+    }
+
+    // ── Side Effects Only: State is derived via getter ────────────────────
+    _onPromptShow() {
+        const isCupertino = this._lockscreenMode === 'cupertino';
+        if (isCupertino) {
+            this._promptActor?.remove_style_class_name('wack-cupertino-rest');
+            this._promptActor?.add_style_class_name('wack-cupertino-prompt');
+            this._cupertinoToPrompt = true;
+            this._setupCupertinoAvatarOverride();
+            // Re-run the unified pipeline so prompt entry tinting is applied
+            // after the entry widget is fully realized in the tree.
+            this._updateClockAlphaAndPromptColor();
+        }
+        this._startCursorBlink();
+    }
+
+    _onPromptHide() {
+        this._stopCursorBlink();
+        if (this._notifManager._notifBox) {
+            this._notifManager.enforceCardLimit(this._notifManager._notifBox);
+        }
+        this._updateCupertinoRestState();
+        this._clearCupertinoPromptBackground();
+        this._lastWellH = undefined;
+        this._lastYCenterFraction = undefined;
+
+        if (this._lockscreenMode === 'cupertino') {
+            const hasNotifs = this._notifManager.hasVisibleNotifs();
+            this._cupertinoIconSnap = !hasNotifs;
+            this._cupertinoToPrompt = false;
+        }
+    }
+
+    _updateCupertinoRestState(animate = false) {
+        if (this._lockscreenMode !== 'cupertino') return;
+        const hasNotifs = this._notifManager.hasVisibleNotifs();
+
+        if (this._cupertinoRestPromptContainer) {
+            if (this._cupertinoRestPrompt?._avatarButton) {
+                this._cupertinoRestPrompt._avatarButton.reactive = this._promptActive;
+                if (!this._promptActive) this._cupertinoRestPrompt._avatarButton.hover = false;
+            }
+
+            const count = this._notifManager.getNativeNotifCount();
+            let nextCount = 0;
+            if (this._cupertinoAlwaysShowUser && count > 0 && !this._cupertinoShowNotifsOverride) {
+                if (!this._cupertinoHintIsToggle) nextCount = count;
+            }
+
+            if (hasNotifs) {
+                const targetOpacity = 0;
+                if (animate) {
+                    const restPromptContainer = this._cupertinoRestPromptContainer;
+                    restPromptContainer.visible = true;
+                    restPromptContainer.ease({
+                        opacity: targetOpacity,
+                        duration: CROSSFADE_TIME,
+                        mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                        onComplete: () => {
+                            if (this._cupertinoRestPromptContainer === restPromptContainer) {
+                                restPromptContainer.visible = false;
+                            }
+                        },
+                    });
+                } else {
+                    this._cupertinoRestPromptContainer.remove_all_transitions();
+                    this._cupertinoRestPromptContainer.opacity = 0;
+                    this._cupertinoRestPromptContainer.visible = false;
+                }
+            } else {
+                this._cupertinoRestPrompt?.setNotifCount(nextCount);
+                const hintBoxWrapper = this._cupertinoRestPrompt?._hintBoxWrapper;
+                const nameLabel = this._cupertinoRestPrompt?._userWell?.get_child()?._label;
+
+                if (animate && !this._promptActive) {
+                    this._cupertinoRestPromptContainer.remove_all_transitions();
+                    this._cupertinoRestPromptContainer.opacity = 0;
+                    this._cupertinoRestPromptContainer.visible = true;
+                    if (hintBoxWrapper) { hintBoxWrapper.remove_all_transitions(); hintBoxWrapper.opacity = 255; }
+                    if (nameLabel) { nameLabel.remove_all_transitions(); nameLabel.opacity = 255; }
+                    this._cupertinoRestPromptContainer.ease({
+                        opacity: 255,
+                        duration: CROSSFADE_TIME,
+                        mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                    });
+                } else {
+                    this._cupertinoRestPromptContainer.remove_all_transitions();
+                    this._cupertinoRestPromptContainer.opacity = 255;
+                    this._cupertinoRestPromptContainer.visible = true;
+                    if (!this._promptActive) {
+                        if (hintBoxWrapper) { hintBoxWrapper.remove_all_transitions(); hintBoxWrapper.opacity = 255; }
+                        if (nameLabel) { nameLabel.remove_all_transitions(); nameLabel.opacity = 255; }
+                    }
+                }
+            }
+        }
+
+        if (this._notifManager._notifBox) {
+            const targetOpacity = (!this._promptActive && hasNotifs) ? 255 : 0;
+            const targetBlur = (!this._promptActive && hasNotifs) ? NOTIF_BLUR_RADIUS : 0;
+
+            if (animate) {
+                const notifBox = this._notifManager._notifBox;
+                if (targetOpacity > 0) notifBox.visible = true;
+                notifBox.ease({
+                    opacity: targetOpacity,
+                    duration: CROSSFADE_TIME,
+                    mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                    onComplete: () => {
+                        if (this._notifManager._notifBox === notifBox) notifBox.visible = targetOpacity > 0;
+                    },
+                });
+
+                const easeBlur = (actor) => {
+                    const effect = actor.get_effect(NOTIF_BLUR_NAME);
+                    if (effect) {
+                        effect.set_enabled(true);
+                        actor.ease_property(`@effects.${NOTIF_BLUR_NAME}.radius`, targetBlur, {
+                            duration: CROSSFADE_TIME,
+                            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                        });
+                    }
+                };
+                notifBox._notificationBox.get_children().forEach(easeBlur);
+                for (const actor of notifBox._players.values()) easeBlur(actor);
+            } else {
+                this._notifManager._notifBox.remove_all_transitions();
+                this._notifManager._notifBox.opacity = targetOpacity;
+                this._notifManager._notifBox.visible = targetOpacity > 0;
+
+                const setBlur = (actor) => {
+                    const effect = actor.get_effect(NOTIF_BLUR_NAME);
+                    if (effect) {
+                        actor.remove_transition(`@effects.${NOTIF_BLUR_NAME}.radius`);
+                        effect.set({ radius: targetBlur });
+                        effect.set_enabled(targetBlur > 0.5);
+                    }
+                };
+                this._notifManager._notifBox._notificationBox.get_children().forEach(setBlur);
+                for (const actor of this._notifManager._notifBox._players.values()) setBlur(actor);
+            }
+        }
+
+        if (this._hintContainer) {
+            const targetHintOpacity = (!this._promptActive && hasNotifs) ? 255 : 0;
+            if (animate) {
+                this._hintContainer.ease({ opacity: targetHintOpacity, duration: CROSSFADE_TIME, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
+            } else {
+                this._hintContainer.remove_all_transitions();
+                this._hintContainer.opacity = targetHintOpacity;
+            }
+        }
+
+        const messageActor = this._getLockscreenMessageActor();
+        if (messageActor && this._lockscreenMessageLabel && this._lockscreenMessageLabel.text !== '') {
+            const targetMessageOpacity = hasNotifs ? 0 : 255;
+            if (animate) {
+                const messageContainer = messageActor;
+                messageContainer.visible = true;
+                messageContainer.ease({
+                    opacity: targetMessageOpacity,
+                    duration: CROSSFADE_TIME,
+                    mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                    onComplete: () => {
+                        if (this._getLockscreenMessageActor() === messageContainer) {
+                            messageContainer.visible = targetMessageOpacity > 0;
+                        }
+                    },
+                });
+            } else {
+                messageActor.remove_all_transitions();
+                _setActorVisible(messageActor, targetMessageOpacity > 0, targetMessageOpacity);
+            }
+        }
+
+        this._updateCupertinoHintCycle();
+    }
+
+    _setupCupertinoAvatarOverride() {
+        if (this._cupertinoAvatarSetup) return;
+        const authPrompt = this._dialog?._authPrompt ?? this._dialog?._promptBox?._authPrompt;
+        if (!authPrompt) return;
+        this._cupertinoAvatarSetup = true;
+
+        if (!this._cupertinoOrigUpdateUser) {
+            const methodName = authPrompt.setUser ? 'setUser' : 'updateUser';
+            this._cupertinoOrigMethodName = methodName;
+            this._cupertinoOrigUpdateUser = authPrompt[methodName].bind(authPrompt);
+            authPrompt[methodName] = (user) => {
+                this._cupertinoOrigUpdateUser(user);
+                const uw = authPrompt._userWell?.get_child();
+                if (uw && uw._avatar) {
+                    uw._avatar.visible = true;
+                    uw._avatar.opacity = 0;
+                }
+            };
+            const promptUserWidget = authPrompt._userWell?.get_child();
+            if (promptUserWidget?._avatar) {
+                promptUserWidget._avatar.visible = true;
+                promptUserWidget._avatar.opacity = 0;
+            }
+        }
+
+        authPrompt.connectObject('destroy', () => this._teardownCupertinoAvatarOverride(), this);
+    }
+
+    _teardownCupertinoAvatarOverride() {
+        const authPrompt = this._dialog?._authPrompt ?? this._dialog?._promptBox?._authPrompt;
+        if (authPrompt) authPrompt.disconnectObject(this);
+
+        if (authPrompt && this._cupertinoOrigUpdateUser && this._cupertinoOrigMethodName) {
+            authPrompt[this._cupertinoOrigMethodName] = this._cupertinoOrigUpdateUser;
+        }
+        this._cupertinoOrigUpdateUser = null;
+        this._cupertinoOrigMethodName = null;
+
+        const promptUserWidget = authPrompt?._userWell?.get_child();
+        if (promptUserWidget?._avatar) {
+            promptUserWidget._avatar.visible = true;
+            promptUserWidget._avatar.opacity = 255;
+        }
+        this._cupertinoAvatarSetup = false;
+    }
+
+    _applyPromptModeLayout() {
+        if (!this._promptActor) return;
+        const isCupertino = this._lockscreenMode === 'cupertino';
+
+        if (isCupertino) {
+            this._createCupertinoRestPrompt();
+            this._promptActor.remove_style_class_name('wack-cupertino-rest');
+            this._promptActor.add_style_class_name('wack-cupertino-prompt');
+            if (this._origPromptActorYAlign === undefined) {
+                this._origPromptActorYAlign = this._promptActor.y_align;
+            }
+            this._promptActor.y_align = Clutter.ActorAlign.START;
+
+            const authPrompt = this._dialog?._authPrompt ?? this._dialog?._promptBox?._authPrompt;
+            if (authPrompt && !this._authPromptAllocationId) {
+                this._authPromptAllocationId = authPrompt.connect('notify::allocation', () => {
+                    this._onAuthPromptAllocation();
+                });
+            }
+
+            if (this._promptActive)
+                this._updateClockAlphaAndPromptColor();
+        } else {
+            this._destroyCupertinoRestPrompt();
+            this._promptActor.remove_style_class_name('wack-cupertino-prompt');
+            this._promptActor.remove_style_class_name('wack-cupertino-rest');
+            this._clearCupertinoPromptBackground();
+            if (this._origPromptActorYAlign !== undefined) {
+                this._promptActor.y_align = this._origPromptActorYAlign;
+                this._origPromptActorYAlign = undefined;
+            }
+
+            if (this._authPromptAllocationId) {
+                const authPrompt = this._dialog?._authPrompt ?? this._dialog?._promptBox?._authPrompt;
+                if (authPrompt) {
+                    authPrompt.disconnect(this._authPromptAllocationId);
+                }
+                this._authPromptAllocationId = 0;
+            }
+        }
+        this._promptActor.set({ scale_x: 1, scale_y: 1 });
+        this._updateCupertinoRestState();
+        this._mainBox?.queue_relayout();
+    }
+
+    triggerSwitchUser() {
+        if (this._lockscreenMode !== 'cupertino') return;
+
+        try {
+            Gdm.goto_login_session_sync(null);
+        } catch (e) {
+            _logError(`WACK lockscreen: failed to switch user: ${e.message}`);
+        }
+    }
+
+    triggerToggleNotifications() {
+        if (this._lockscreenMode === 'cupertino' && this._cupertinoAlwaysShowUser && !this._promptActive) {
+            if (this._notifManager.getNativeNotifCount() > 0 || this._cupertinoShowNotifsOverride) {
+                this._cupertinoHintIsToggle = false;
+                this._cupertinoShowNotifsOverride = !this._cupertinoShowNotifsOverride;
+                this._updateCupertinoRestState(true);
+            }
+        }
+    }
+
+    _createCupertinoRestPrompt() {
+        if (this._cupertinoRestPromptContainer) return;
+
+        this._cupertinoRestPromptContainer = new St.BoxLayout({
+            style_class: 'wack-cupertino-rest',
+            vertical: true,
+            reactive: false,
+        });
+
+        this._cupertinoRestPrompt = new WackCupertinoRestPrompt(this._dialog._user, this);
+        this._cupertinoRestPromptContainer.add_child(this._cupertinoRestPrompt);
+        this._dialog._stack.add_child(this._cupertinoRestPromptContainer);
+        this._updateLockscreenMessage();
+
+        if (!this._cupertinoSeat) {
+            const backend = this.get_context?.().get_backend() ?? Clutter.get_default_backend();
+            this._cupertinoSeat = backend.get_default_seat();
+            this._cupertinoSeat.connectObject('notify::touch-mode', () => this._syncCupertinoHint(), this);
+        }
+        this._syncCupertinoHint();
+    }
+
+    _syncCupertinoHint() {
+        const touchMode = this._cupertinoSeat?.touch_mode ?? false;
+        this._cupertinoBaseHintText = touchMode
+            ? shellGettext('Swipe up to unlock')
+            : shellGettext('Click or press a key to unlock');
+        this._cupertinoToggleHintText = this.gettext('Press Shift + N to view notifications');
+        this._updateCupertinoHintCycle();
+    }
+
+    _showInhibitHint(message) {
+        if (this._inhibitHintTimeoutId) {
+            GLib.source_remove(this._inhibitHintTimeoutId);
+            this._inhibitHintTimeoutId = null;
+        }
+
+        const wackActor = this._overflowActive ? this._overflowLabel : this._hint;
+        const cupertinoActor = (this._lockscreenMode === 'cupertino' && this._cupertinoRestPrompt)
+            ? this._cupertinoRestPrompt._hintBox : null;
+
+        this._showingInhibitHint = true;
+
+        if (this._lockscreenMode === 'cupertino' && this._cupertinoHintCycleId) {
+            GLib.source_remove(this._cupertinoHintCycleId);
+            this._cupertinoHintCycleId = null;
+        }
+
+        wackActor?.remove_all_transitions();
+        cupertinoActor?.remove_all_transitions();
+
+        if (wackActor) {
+            wackActor.opacity = 255;
+            wackActor.visible = true;
+            if (this._overflowActive) {
+                const prefix = wackActor.text.split('  ·  ')[0];
+                wackActor.text = `${prefix}  ·  ${message}`;
+                this._notifManager.positionOverflow();
+            } else {
+                wackActor.text = message;
+                this._positionHint();
+            }
+        }
+
+        if (this._cupertinoRestPrompt) {
+            if (cupertinoActor) {
+                cupertinoActor.opacity = 255;
+                cupertinoActor.visible = true;
+            }
+            this._cupertinoRestPrompt.setHintText(message);
+            this._cupertinoRestPrompt.setNotifCount(0);
+        }
+
+        if (this._inhibitHintTimeoutId) {
+            GLib.source_remove(this._inhibitHintTimeoutId);
+            this._inhibitHintTimeoutId = null;
+        }
+
+        this._inhibitHintTimeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 3, () => {
+            this._showingInhibitHint = false;
+            this._inhibitHintTimeoutId = null;
+
+            wackActor?.remove_all_transitions();
+            cupertinoActor?.remove_all_transitions();
+
+            const fadeOutDuration = 150;
+            const fadeInDuration = 150;
+
+            if (wackActor) {
+                wackActor.ease({
+                    opacity: 0,
+                    duration: fadeOutDuration,
+                    mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                    onComplete: () => {
+                        if (this._overflowActive) {
+                            this._notifManager.enforceCardLimit(this._dialog._notificationsBox);
+                        } else {
+                            wackActor.text = this._hintText;
+                            this._positionHint();
+                        }
+                        wackActor.ease({ opacity: 255, duration: fadeInDuration, mode: Clutter.AnimationMode.EASE_IN_QUAD });
+                    }
+                });
+            }
+
+            if (cupertinoActor) {
+                cupertinoActor.ease({
+                    opacity: 0,
+                    duration: fadeOutDuration,
+                    mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                    onComplete: () => {
+                        if (this._cupertinoRestPrompt) {
+                            this._cupertinoHintIsToggle = false;
+                            const nativeCount = this._notifManager.getNativeNotifCount();
+                            const count = (this._cupertinoAlwaysShowUser && !this._cupertinoShowNotifsOverride) ? nativeCount : 0;
+                            const baseText = this._cupertinoShowNotifsOverride
+                                ? shellGettext('Swipe up to unlock')
+                                : shellGettext('Click or press a key to unlock');
+
+                            this._cupertinoRestPrompt.setHintText(baseText);
+                            this._cupertinoRestPrompt.setNotifCount(count);
+                        }
+                        cupertinoActor.ease({
+                            opacity: 255,
+                            duration: fadeInDuration,
+                            mode: Clutter.AnimationMode.EASE_IN_QUAD,
+                            onComplete: () => this._updateCupertinoHintCycle()
+                        });
+                    }
+                });
+            }
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _getLockscreenMessageActor() {
+        return this._lockscreenMessageScrollView ?? this._lockscreenMessageLabel ?? null;
+    }
+
+    _getLockscreenMessageWidth() {
+        if (this._mainBox?.allocation) {
+            const box = this._mainBox.allocation;
+            const width = box.x2 - box.x1;
+            if (width > 0)
+                return Math.floor(width / 3);
+        }
+
+        const monitor = Main.layoutManager?.primaryMonitor;
+        return monitor ? Math.floor(monitor.width / 3) : 0;
+    }
+
+    _getLockscreenMessageLineHeight() {
+        const clutterText = this._lockscreenMessageLabel?.clutter_text;
+        const layout = clutterText?.get_layout?.();
+        const context = layout?.get_context?.();
+        const fontDescription = layout?.get_font_description?.();
+
+        if (context && fontDescription) {
+            const metrics = context.get_metrics(fontDescription, Pango.Language.get_default());
+            const metricsHeight = metrics.get_height();
+            if (metricsHeight > 0)
+                return Math.ceil(metricsHeight / Pango.SCALE);
+
+            const ascent = metrics.get_ascent();
+            const descent = metrics.get_descent();
+            if (ascent + descent > 0)
+                return Math.ceil((ascent + descent) / Pango.SCALE);
+        }
+
+        const [, naturalHeight] = this._lockscreenMessageLabel?.get_preferred_height?.(-1) ?? [0, 0];
+        return Math.ceil(naturalHeight);
+    }
+
+    _getLockscreenMessageLineCount() {
+        const layout = this._lockscreenMessageLabel?.clutter_text?.get_layout?.();
+        return layout?.get_line_count?.() ?? 0;
+    }
+
+    _syncLockscreenMessageFade() {
+        if (!this._lockscreenMessageScrollView)
+            return;
+
+        if (this._lockscreenMessageHasOverflow)
+            this._lockscreenMessageScrollView.add_style_class_name('vfade');
+        else
+            this._lockscreenMessageScrollView.remove_style_class_name('vfade');
+    }
+
+    _syncLockscreenMessageLayout() {
+        if (!this._lockscreenMessageLabel || !this._lockscreenMessageScrollView || !this._lockscreenMessageContent)
+            return;
+
+        const messageWidth = this._getLockscreenMessageWidth();
+        if (messageWidth <= 0)
+            return;
+
+        this._lockscreenMessageWidth = messageWidth;
+        this._lockscreenMessageContent.width = messageWidth;
+        this._lockscreenMessageLabel.x_expand = true;
+        this._lockscreenMessageLabel.x_align = Clutter.ActorAlign.CENTER;
+
+        const lineHeight = this._getLockscreenMessageLineHeight();
+        const maxVisibleHeight = Math.ceil(lineHeight * 4);
+        const [, naturalHeight] = this._lockscreenMessageLabel.get_preferred_height(messageWidth);
+        const clampedHeight = Math.min(naturalHeight, maxVisibleHeight);
+        const lineCount = this._getLockscreenMessageLineCount();
+
+        this._lockscreenMessageHasOverflow = lineCount > 4 || (lineCount === 0 && naturalHeight > maxVisibleHeight);
+        this._lockscreenMessageHeight = clampedHeight;
+
+        if (!this._lockscreenMessageHasOverflow)
+            this._lockscreenMessageScrollView.vadjustment?.set_value(0);
+
+        this._syncLockscreenMessageFade();
+        this._mainBox?.queue_relayout();
+    }
+
+    _updateLockscreenMessage() {
+        if (!this._lockscreenMessageLabel) return;
+        const enabled = this._settings.get_boolean('cupertino-lockscreen-message-enable');
+        const text = this._settings.get_string('cupertino-lockscreen-message-text');
+        const cleanText = (text || '').trim();
+        const messageActor = this._getLockscreenMessageActor();
+        if (enabled && cleanText) {
+            this._lockscreenMessageLabel.text = cleanText;
+            this._syncLockscreenMessageLayout();
+            if (this._lockscreenMode === 'cupertino') {
+                const hasNotifs = this._notifManager ? this._notifManager.hasVisibleNotifs() : false;
+                const shouldBeVisible = this._promptActive || !hasNotifs;
+                _setActorVisible(messageActor, shouldBeVisible, shouldBeVisible ? 255 : 0);
+            } else {
+                _setActorVisible(messageActor, this._promptActive, this._promptActive ? 255 : 0);
+            }
+        } else {
+            this._lockscreenMessageLabel.text = '';
+            this._lockscreenMessageHasOverflow = false;
+            this._lockscreenMessageHeight = 0;
+            this._syncLockscreenMessageFade();
+            _setActorVisible(messageActor, false, 0);
+        }
+        if (this._mainBox) {
+            this._mainBox.queue_relayout();
+        }
+    }
+
+    _isSleepInhibited() {
+        try {
+            const result = Gio.DBus.system.call_sync(
+                'org.freedesktop.login1',
+                '/org/freedesktop/login1',
+                'org.freedesktop.login1.Manager',
+                'ListInhibitors',
+                null, null, Gio.DBusCallFlags.NONE, -1, null
+            );
+            const [inhibitors] = result.deepUnpack();
+            for (const [what, who, why, mode] of inhibitors) {
+                if (what.includes('sleep') && mode === 'block') {
+                    if (why === 'user-active-inhibitor' ||
+                        who === 'gnome-session-binary' ||
+                        who === 'gnome-session-service' ||
+                        who === 'gnome-session-s' ||
+                        who === 'gnome-shell' ||
+                        who === 'gsd-power' ||
+                        who === 'gsd-media-keys') {
+                        continue;
+                    }
+                    return true;
+                }
+            }
+        } catch (err) {
+            // Ignore and assume not inhibited
+        }
+        return false;
+    }
+
+    _updateCupertinoHintCycle() {
+        if (!this._cupertinoRestPrompt) return;
+
+        const nativeCount = this._notifManager.getNativeNotifCount();
+        const shouldCycle = this._lockscreenMode === 'cupertino' &&
+            this._cupertinoAlwaysShowUser &&
+            !this._cupertinoShowNotifsOverride &&
+            nativeCount > 0 &&
+            !this._promptActive;
+
+        if (shouldCycle) {
+            if (!this._cupertinoHintCycleId) {
+                this._cupertinoHintIsToggle = false;
+                this._cupertinoRestPrompt.setHintText(this._cupertinoBaseHintText);
+
+                if (this._cupertinoHintCycleId) {
+                    GLib.source_remove(this._cupertinoHintCycleId);
+                    this._cupertinoHintCycleId = null;
+                }
+                this._cupertinoHintCycleId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 8, () => {
+                    this._cupertinoHintIsToggle = !this._cupertinoHintIsToggle;
+                    const nextText = this._cupertinoHintIsToggle ? this._cupertinoToggleHintText : this._cupertinoBaseHintText;
+
+                    if (this._cupertinoRestPrompt && this._cupertinoRestPrompt._hintBox) {
+                        const hintBox = this._cupertinoRestPrompt._hintBox;
+                        hintBox.ease({
+                            opacity: 0,
+                            duration: CROSSFADE_TIME / 2,
+                            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                            onComplete: () => {
+                                if (!this._cupertinoRestPrompt) return;
+                                this._cupertinoRestPrompt.setHintText(nextText);
+                                if (this._cupertinoHintIsToggle) {
+                                    this._cupertinoRestPrompt.setNotifCount(0);
+                                } else {
+                                    this._cupertinoRestPrompt.setNotifCount(this._notifManager.getNativeNotifCount());
+                                }
+                                hintBox.ease({ opacity: 255, duration: CROSSFADE_TIME / 2, mode: Clutter.AnimationMode.EASE_IN_QUAD });
+                            }
+                        });
+                    }
+                    return GLib.SOURCE_CONTINUE;
+                });
+            }
+        } else {
+            if (this._cupertinoHintCycleId) {
+                GLib.source_remove(this._cupertinoHintCycleId);
+                this._cupertinoHintCycleId = null;
+            }
+            this._cupertinoHintIsToggle = false;
+            if (this._cupertinoRestPrompt && this._cupertinoRestPrompt._hintBox) {
+                this._cupertinoRestPrompt._hintBox.remove_all_transitions();
+                this._cupertinoRestPrompt._hintBox.opacity = 255;
+                if (!this._notifManager.hasVisibleNotifs() && !this._promptActive) {
+                    this._cupertinoRestPrompt.setHintText(this._cupertinoBaseHintText || '');
+                }
+            }
+        }
+    }
+
+    _destroyCupertinoRestPrompt() {
+        if (this._cupertinoHintCycleId) {
+            GLib.source_remove(this._cupertinoHintCycleId);
+            this._cupertinoHintCycleId = null;
+        }
+        if (this._cupertinoSeat) {
+            this._cupertinoSeat.disconnectObject(this);
+            this._cupertinoSeat = null;
+        }
+        if (this._cupertinoRestPrompt) {
+            this._cupertinoRestPrompt.destroy();
+            this._cupertinoRestPrompt = null;
+        }
+        if (this._cupertinoRestPromptContainer) {
+            this._cupertinoRestPromptContainer.destroy();
+            this._cupertinoRestPromptContainer = null;
+        }
+    }
+
+    _positionClock() {
+        const monitor = Main.layoutManager.primaryMonitor;
+        if (!monitor) return;
+        const monitorX = monitor.x;
+        const monitorY = monitor.y;
+        const monitorWidth = monitor.width;
+        const monitorHeight = monitor.height;
+
+        const wrapper = this._clockWrapper;
+        const dateLabel = this._dateLabel;
+        const timeLabel = this._timeLabel;
+        if (!wrapper || !dateLabel || !timeLabel) return;
+
+        const topY = monitorY + Math.floor(monitorHeight * DATETIME_TOP_FRACTION);
+
+        dateLabel.set_position(0, 0);
+        timeLabel.set_position(0, DATE_LABEL_HEIGHT);
+
+        wrapper.set_position(monitorX, topY);
+        wrapper.set_width(monitorWidth);
+        wrapper.set_pivot_point(0.5, 0.5);
+    }
+
+    _positionHint() {
+        if (!this._hint) return;
+        const monitor = Main.layoutManager.primaryMonitor;
+        if (!monitor) return;
+        const monitorX = monitor.x;
+        const monitorY = monitor.y;
+        const monitorWidth = monitor.width;
+        const monitorHeight = monitor.height;
+
+        this._hint.set_width(-1);
+        const [, natWidth] = this._hint.get_preferred_width(-1);
+        const [, natHeight] = this._hint.get_preferred_height(-1);
+
+        const notifBox = this._dialog?._notificationsBox;
+        const notifHeight = notifBox?.visible ? notifBox.height : 0;
+
+        const idealY = monitorY + Math.floor(monitorHeight * HINT_VERTICAL_FRACTION);
+        const notifTop = monitorY + monitorHeight - notifHeight - HINT_NOTIF_MARGIN - natHeight;
+        const y = Math.min(idealY, notifTop);
+
+        const x = monitorX + Math.floor((monitorWidth - natWidth) / 2);
+        this._hint.set_position(x, y);
+        this._hint.set_width(natWidth);
+    }
+
+    _tempSessionModeOverride() {
+        if (this._origSessionModeProps) return;
+        this._origSessionModeProps = {
+            hasWindows: Main.sessionMode.hasWindows,
+            hasWorkspaces: Main.sessionMode.hasWorkspaces,
+            panel: Main.sessionMode.panel,
+            panelStyle: Main.sessionMode.panelStyle,
+        };
+        Main.sessionMode.hasWindows = true;
+        Main.sessionMode.hasWorkspaces = true;
+        Main.sessionMode.panel = {
+            left: ['activities'],
+            center: ['dateMenu'],
+            right: ['screenRecording', 'screenSharing', 'dwellClick', 'a11y', 'keyboard', 'quickSettings'],
+        };
+        Main.sessionMode.panelStyle = null;
+        Main.sessionMode.emit('updated');
+    }
+
+    _restoreSessionMode() {
+        if (!this._origSessionModeProps) return;
+        Main.sessionMode.hasWindows = this._origSessionModeProps.hasWindows;
+        Main.sessionMode.hasWorkspaces = this._origSessionModeProps.hasWorkspaces;
+        Main.sessionMode.panel = this._origSessionModeProps.panel;
+        Main.sessionMode.panelStyle = this._origSessionModeProps.panelStyle;
+        this._origSessionModeProps = null;
+        Main.sessionMode.emit('updated');
+    }
+
+
+    _getUserThemeFile() {
+        const shellSettings = new Gio.Settings({ schema_id: 'org.gnome.shell' });
+        const enabledExtensions = shellSettings.get_strv('enabled-extensions');
+        if (!enabledExtensions.includes('user-theme@gnome-shell-extensions.gcampax.github.com')) {
+            return null;
+        }
+        const schemaSource = Gio.SettingsSchemaSource.get_default();
+        if (!schemaSource) return null;
+        const schema = schemaSource.lookup('org.gnome.shell.extensions.user-theme', true);
+        if (!schema) return null;
+
+        const themeSettings = new Gio.Settings({ settings_schema: schema });
+        const themeName = themeSettings.get_string('name');
+        if (!themeName) return null;
+
+        const paths = [
+            GLib.build_filenamev([GLib.get_home_dir(), '.themes', themeName, 'gnome-shell', 'gnome-shell.css']),
+            GLib.build_filenamev([GLib.get_user_data_dir(), 'themes', themeName, 'gnome-shell', 'gnome-shell.css']),
+            GLib.build_filenamev(['/usr/share/themes', themeName, 'gnome-shell', 'gnome-shell.css'])
+        ];
+
+        for (const path of paths) {
+            const file = Gio.File.new_for_path(path);
+            if (file.query_exists(null)) return file;
+        }
+        return null;
+    }
+
+    // Guideline EGO-M-008: Documenting use of unlock-dialog.
+    // This extension runs in the 'unlock-dialog' session mode to customize the
+    // GNOME Shell lock screen. We perform the following modifications:
+    // - Replace the default clock widget (dialog._clock) with our custom clock
+    //   wrapper to display a macOS Sonoma-style clock layout.
+    // - Override dialog._updateBackgroundEffects to customize background blur.
+    // - Override dialog._updateUserSwitchVisibility to hide/show user options.
+    // - Intercept dialog.finish to animate custom transitions when unlocking.
+    //
+    // In this disable() method, we cleanly revert all changes, restore all overridden
+    // methods/injections to their original implementations, and destroy/nullify all
+    // custom UI elements, ensuring no resource leaks or state contamination in the
+    // GNOME Shell session.
+    disable() {
+        this._isActive = false;
+        // Invalidate any in-flight async _updateClockAlphaAndPromptColor calls.
+        this._wallpaperUpdateSeq = (this._wallpaperUpdateSeq ?? 0) + 1;
+        this._stopCursorBlink();
+        if (this._gdmManager) {
+            this._gdmManager.disable();
+            this._gdmManager = null;
+        }
+
+        if (this._crossSessionManager) {
+            this._crossSessionManager.disable();
+            this._crossSessionManager = null;
+        }
+
+        if (this._bgSettings) {
+            this._bgSettings.disconnectObject(this);
+            this._bgSettings = null;
+        }
+
+        if (this._interfaceSettings) {
+            this._interfaceSettings.disconnectObject(this);
+            this._interfaceSettings = null;
+        }
+
+        clearCache();
+
+        if (this._dialog && this._origFinish) {
+            this._dialog.finish = this._origFinish;
+            this._origFinish = null;
+        }
+
+        if (this._origStylesheet !== undefined) {
+            if (Main.sessionMode.currentMode !== 'user') {
+                Main.setThemeStylesheet(this._origStylesheet ? this._origStylesheet.get_path() : null);
+                Main.loadTheme();
+            }
+            this._origStylesheet = undefined;
+        }
+
+        if (this._origContinueDeactivate) {
+            if (Main.screenShield) Main.screenShield._continueDeactivate = this._origContinueDeactivate;
+            this._origContinueDeactivate = null;
+        }
+
+        if (this._finishTimeoutId) {
+            GLib.source_remove(this._finishTimeoutId);
+            this._finishTimeoutId = null;
+        }
+
+        if (this._finishFallbackId) {
+            GLib.source_remove(this._finishFallbackId);
+            this._finishFallbackId = null;
+        }
+
+        if (this._windowFadeContainer) {
+            this._windowFadeContainer.destroy();
+            this._windowFadeContainer = null;
+        }
+
+        if (this._origSessionModeProps) {
+            this._restoreSessionMode();
+        }
+
+        if (Main.panel) {
+            Main.panel.remove_all_transitions();
+            Main.panel.translation_y = 0;
+            Main.panel.opacity = 255;
+        }
+
+        if (this._unblankManager) {
+            this._unblankManager.destroy();
+            this._unblankManager = null;
+        }
+
+        if (Main.panel?.statusArea?.dateMenu?.container) {
+            if (this._wasDateMenuVisible) Main.panel.statusArea.dateMenu.container.show();
+            this._wasDateMenuVisible = null;
+        }
+
+        if (this._idleSources) {
+            for (const id of this._idleSources) GLib.source_remove(id);
+            this._idleSources.clear();
+        }
+
+        if (this._dialog && this._origUpdateBgEffects) {
+            this._dialog._updateBackgroundEffects = this._origUpdateBgEffects;
+            this._origUpdateBgEffects = null;
+            this._dialog._updateBackgroundEffects();
+        }
+
+        if (this._dialog && this._origUpdateUserSwitchVisibility) {
+            this._dialog._updateUserSwitchVisibility = this._origUpdateUserSwitchVisibility;
+            this._origUpdateUserSwitchVisibility = null;
+            this._dialog._updateUserSwitchVisibility();
+        }
+
+        if (this._notifManager) {
+            this._notifManager.teardownNotifBlur();
+            this._notifManager = null;
+        }
+
+        if (this._dialog && this._origSetTransitionProgress) {
+            this._dialog._setTransitionProgress = this._origSetTransitionProgress;
+            this._origSetTransitionProgress = null;
+        }
+
+        if (this._inhibitHintTimeoutId) {
+            GLib.source_remove(this._inhibitHintTimeoutId);
+            this._inhibitHintTimeoutId = null;
+        }
+
+        this._teardownCupertinoAvatarOverride();
+        if (this._cupertinoHintCycleId) {
+            GLib.source_remove(this._cupertinoHintCycleId);
+            this._cupertinoHintCycleId = null;
+        }
+        this._destroyCupertinoRestPrompt();
+
+        resetAnimationActors(this._clockWrapper, this._promptActor);
+        const authPrompt = this._dialog?._authPrompt ?? this._dialog?._promptBox?._authPrompt;
+        const mainBox = authPrompt?._mainBox;
+        if (mainBox) mainBox.opacity = 255;
+        if (this._dialog) this._dialog.opacity = 255;
+
+        if (this._wackShellStateChangedId) {
+            Main.extensionManager.disconnect(this._wackShellStateChangedId);
+            this._wackShellStateChangedId = 0;
+        }
+
+        if (this._settings) {
+            this._settings.disconnectObject(this);
+            this._settings = null;
+        }
+
+        if (this._powerProfilesProxy) {
+            this._powerProfilesProxy.disconnectObject(this);
+            this._powerProfilesProxy = null;
+        }
+
+        if (this._notifSettings) {
+            this._notifSettings.disconnectObject(this);
+            this._notifSettings = null;
+        }
+        this._notifShowInLockScreen = false;
+
+        this._injectionManager?.clear();
+        this._injectionManager = null;
+
+        if (this._authPromptAllocationId) {
+            const authPrompt = this._dialog?._authPrompt ?? this._dialog?._promptBox?._authPrompt;
+            if (authPrompt) {
+                authPrompt.disconnect(this._authPromptAllocationId);
+            }
+            this._authPromptAllocationId = 0;
+        }
+
+        if (this._dialog) {
+            this._dialog._notificationsBox?.disconnectObject(this);
+            this._dialog.disconnectObject(this);
+        }
+        Main.layoutManager.disconnectObject(this);
+
+        const lockDialogGroup = Main.screenShield?._lockDialogGroup;
+
+        if (this._hint) {
+            this._hint.disconnectObject(this);
+            this._hint.visible = true;
+            this._hint = null;
+        }
+
+        if (this._overflowLabel) {
+            this._overflowLabel.destroy();
+            this._overflowLabel = null;
+        }
+
+        if (this._hintContainer) {
+            lockDialogGroup?.remove_child(this._hintContainer);
+            this._hintContainer.destroy();
+            this._hintContainer = null;
+        }
+
+        if (this._dateLabel) {
+            this._dateLabel.disconnectObject(this);
+            this._dateLabel = null;
+        }
+        if (this._timeLabel) {
+            this._timeLabel.disconnectObject(this);
+            this._timeLabel = null;
+        }
+        if (this._clockWrapper) {
+            lockDialogGroup?.remove_child(this._clockWrapper);
+            this._clockWrapper.destroy();
+            this._clockWrapper = null;
+        }
+
+        if (this._dialog && this._dialog._clock) {
+            lockDialogGroup?.remove_child(this._dialog._clock);
+            this._dialog._clock.destroy();
+            this._dialog._clock = null;
+        }
+
+        if (this._dialog && this._originalClock) {
+            this._dialog._clock = this._originalClock;
+            this._dialog._stack.add_child(this._originalClock);
+        }
+
+        if (this._mainBox && this._origLayout) {
+            const oldLayout = this._mainBox.layout_manager;
+            if (this._lockscreenMessageLabel) {
+                this._lockscreenMessageLabel.destroy();
+                this._lockscreenMessageLabel = null;
+            }
+            if (this._lockscreenMessageContent) {
+                this._lockscreenMessageContent.destroy();
+                this._lockscreenMessageContent = null;
+            }
+            if (this._lockscreenMessageScrollView) {
+                this._mainBox.remove_child(this._lockscreenMessageScrollView);
+                this._lockscreenMessageScrollView.destroy();
+                this._lockscreenMessageScrollView = null;
+            }
+            this._mainBox.layout_manager = this._origLayout;
+            if (oldLayout && oldLayout !== this._origLayout) oldLayout._extension = null;
+            this._mainBox.opacity = 255;
+            this._mainBox.queue_relayout();
+        }
+
+        this._dialog = null;
+        this._originalClock = null;
+        this._mainBox = null;
+        this._origLayout = null;
+        this._overflowActive = false;
+        this._hintText = null;
+
+        if (this._promptActor && this._origPromptActorYAlign !== undefined) {
+            this._promptActor.y_align = this._origPromptActorYAlign;
+            this._origPromptActorYAlign = undefined;
+        }
+        this._promptActor?.remove_style_class_name('wack-cupertino-prompt');
+        this._promptActor = null;
+        this._animationState = null;
+        this._wasPromptActive = false;
+    }
+}

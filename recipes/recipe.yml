@@ -23,23 +23,51 @@ modules:
         - atim/starship
     install:
       packages:
+        - 7zip-standalone
+        - btrfs-progs
+        - cargo
+        - distrobox
+        - gamemode
+        - gcc
+        - gcc-c++
+        - git
+        - meson
+        - ninja-build
+        - nodejs22
+        - podman
+        - podman-compose
+        - python3-pip
+        - smartmontools
+        - steam-devices
+        - toolbox
         - micro
         - starship
     remove:
       packages:
-        # example: removing firefox (in favor of the flatpak)
-        # "firefox" is the main package, "firefox-langpacks" is a dependency
         - firefox
-        - firefox-langpacks # also remove firefox dependency (not required for all packages, this is a special case)
+        - firefox-langpacks
 
   - type: default-flatpaks
     configurations:
-      - notify: true # Send notification after install/uninstall is finished (true/false)
+      - notify: true
         scope: system
-        # If no repo information is specified, Flathub will be used by default
-        install: # system flatpaks we want all users to have and not remove
+        install:
           - org.mozilla.firefox
           - org.gnome.Loupe
-      - scope: user # Also add Flathub user repo, but no user packages
+          - com.valvesoftware.Steam
+          - com.discordapp.Discord
+          - com.obsproject.Studio
+          - com.usebottles.bottles
+          - org.kde.kdenlive
+          - net.blockbench.Blockbench
+          - com.vysp3r.ProtonPlus
+          - com.github.tchx84.Flatseal
+          - com.mattjakeman.ExtensionManager
+          - org.gnome.World.PikaBackup
+          - org.localsend.localsend_app
+          - org.gnome.Builder
+          - io.github.flattool.Warehouse
+          - com.ranfdev.DistroShelf
+      - scope: user #Also add Flathub user repo, but no user packages
 
   - type: signing # this sets up the proper policy & signing files for signed images to work fully
